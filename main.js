@@ -793,6 +793,20 @@ class Surface {
     ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832);
     ctx.lineWidth = 1.2 / this.scale; ctx.strokeStyle = this.resolveColor('ink'); ctx.globalAlpha = 0.45; ctx.stroke(); ctx.globalAlpha = 1;
   }
+  /* ----- leaving a section: empty space above the first ink is removed -----
+   * Whole lines only, so writing stays on its ruled line. One undo step. Sections only, never full pages. */
+  trimTop() {
+    if (!this.embed || this.dead || this.unreadable || this.active || !this.strokes.length) return;
+    let top = Infinity;
+    for (const s of this.strokes) if (s.bb[1] < top) top = s.bb[1];
+    const k = Math.floor(Math.max(0, top) / LINE_GAP);
+    if (k < 1) return;
+    const before = this.strokes.slice(), after = before.map(s => shifted(s, 0, -k * LINE_GAP));
+    this.setStrokes(after);
+    this.pushUndo({ t: 'swap', before, after: after.slice() });
+    this.refit(); this.changed(); this.refreshBar();
+  }
+
   /* ----- selection: lasso around ink, then move, copy, cut, recolour or delete it ----- */
   accent() { return getComputedStyle(this.doc.body).getPropertyValue('--interactive-accent').trim() || '#7c5cff'; }
   selDown(e, type, rect) {
@@ -1067,6 +1081,7 @@ class ScribbleEmbed extends MarkdownRenderChild {
   }
   onunload() {
     this.gone = true;
+    if (this.surface && this.plugin.focused === this.surface) this.plugin.setFocus(null);   // tidies the top; saved just below
     if (this.timer) { clearTimeout(this.timer); this.save(); }   // flush pending ink before the section goes away
     if (this.surface) { this.surface.destroy(); this.surface = null; }
   }
@@ -1248,7 +1263,7 @@ module.exports = class ScribblePlugin extends Plugin {
     if (s && s.dead) s = null;
     if (this.focused === s) return;
     const was = this.focused;
-    if (was) { was.root.removeClass('is-focused'); was.clearSelection(); }
+    if (was) { was.root.removeClass('is-focused'); was.clearSelection(); was.trimTop(); }   // leaving editing: tidy the top
     this.focused = s;
     if (s && !was) { for (const [t, type, fn, o] of this.writing) t.addEventListener(type, fn, o); document.body.dataset.ignoreSwipe = 'true'; }
     if (!s && was) { for (const [t, type, fn, o] of this.writing) t.removeEventListener(type, fn, o); delete document.body.dataset.ignoreSwipe; this.penDown = false; this.penTouch = null; }
