@@ -31,7 +31,8 @@ const MIN_W = 0.6, MAX_W = 14;
 const PREFS_KEY = 'rabby-scribble-pen';
 const BACKGROUNDS = { ruled: 'Ruled lines', grid: 'Grid', dots: 'Dots', none: 'Blank' };
 const ERASERS = { partial: 'Partial: erase only what it touches', stroke: 'Whole stroke: erase each stroke it touches' };
-const DEFAULT_SETTINGS = { background: 'ruled', eraser: 'partial', eraserSize: ERASER_R };
+const DEFAULT_SETTINGS = { background: 'ruled', eraser: 'partial', eraserSize: ERASER_R, shapes: true, shapeHold: 500 };
+const SHAPE_STILL_PX = 4;   // the pen counts as held still while it stays within this many screen pixels
 // Pen types: name, toolbar icon, starting size and colour. How each one LOOKS is in LOOKS below.
 const PENS = {
   fountain: { label: 'Fountain pen', icon: 'pen-tool', def: { size: 3.2, color: 'ink' } },
@@ -243,6 +244,267 @@ function parseDoc(data) {
     out.push(s);
   }
   return out;
+}
+
+/* ---------- shape recognition: draw, hold still, and the stroke snaps to a clean shape ---------- */
+// Input: flat [x, y, x, y, ...] of the hand-drawn stroke (page units).
+// Output: null (leave the stroke alone) or { kind, xy: flat clean points, ax, ay (anchor for hold-to-adjust) }.
+
+function pathLen(q) { let L = 0; for (let i = 2; i < q.length; i += 2) L += Math.hypot(q[i] - q[i - 2], q[i + 1] - q[i - 1]); return L; }
+function resample(q, step) {   // evenly spaced points along a polyline
+  const out = [q[0], q[1]]; let carry = 0;
+  for (let i = 2; i < q.length; i += 2) {
+    let ax = q[i - 2], ay = q[i - 1]; const bx = q[i], by = q[i + 1];
+    let seg = Math.hypot(bx - ax, by - ay);
+    while (carry + seg >= step) {
+      const t = (step - carry) / seg;
+      ax += (bx - ax) * t; ay += (by - ay) * t; seg = Math.hypot(bx - ax, by - ay);
+      out.push(ax, ay); carry = 0;
+    }
+    carry += seg;
+  }
+  if (out[out.length - 2] !== q[q.length - 2] || out[out.length - 1] !== q[q.length - 1]) out.push(q[q.length - 2], q[q.length - 1]);
+  return out;
+}
+function rdp(q, i0, i1, eps, keep) {   // Ramer-Douglas-Peucker on point indices
+  let best = -1, dmax = 0;
+  for (let i = i0 + 1; i < i1; i++) {
+    const d = Math.sqrt(distSegSq(q[2 * i], q[2 * i + 1], q[2 * i0], q[2 * i0 + 1], q[2 * i1], q[2 * i1 + 1]));
+    if (d > dmax) { dmax = d; best = i; }
+  }
+  if (dmax > eps) { rdp(q, i0, best, eps, keep); keep.push(best); rdp(q, best, i1, eps, keep); }
+}
+function angleAt(ax, ay, bx, by, cx, cy) {   // interior angle at b, degrees
+  const ux = ax - bx, uy = ay - by, vx = cx - bx, vy = cy - by;
+  const c = (ux * vx + uy * vy) / (Math.hypot(ux, uy) * Math.hypot(vx, vy) || 1);
+  return Math.acos(Math.max(-1, Math.min(1, c))) * 180 / Math.PI;
+}
+function snapAngle(a, step, tol) {   // radians; snap to multiples of step (radians) within tol
+  const k = Math.round(a / step), d = a - k * step;
+  return Math.abs(d) <= tol ? k * step : a;
+}
+function polyPoints(v, closed, step) {   // vertices [[x,y],...] -> dense flat points
+  const q = [];
+  const n = v.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const [ax, ay] = v[i], [bx, by] = v[(i + 1) % n];
+    const k = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / step));
+    for (let j = 0; j < k; j++) q.push(ax + (bx - ax) * j / k, ay + (by - ay) * j / k);
+  }
+  if (closed) { q.push(v[0][0], v[0][1]); const [bx, by] = v[1 % n], dx = bx - v[0][0], dy = by - v[0][1], l = Math.hypot(dx, dy) || 1; q.push(v[0][0] + dx / l * Math.min(step, l), v[0][1] + dy / l * Math.min(step, l)); }   // overlap a hair so the join closes
+  else q.push(v[n - 1][0], v[n - 1][1]);
+  return q;
+}
+function ellipsePoints(cx, cy, a, b, th, step) {
+  const per = Math.PI * (3 * (a + b) - Math.sqrt((3 * a + b) * (a + 3 * b)));
+  const n = Math.max(40, Math.ceil(per / step)), c = Math.cos(th), s = Math.sin(th), q = [];
+  for (let i = 0; i <= n + 1; i++) {   // one step past the start so the join closes
+    const t = 2 * Math.PI * i / n, u = a * Math.cos(t), w = b * Math.sin(t);
+    q.push(cx + u * c - w * s, cy + u * s + w * c);
+  }
+  return q;
+}
+function fitCircle(q) {   // algebraic (Kasa) least squares
+  let sx = 0, sy = 0, n = q.length / 2;
+  for (let i = 0; i < q.length; i += 2) { sx += q[i]; sy += q[i + 1]; }
+  const mx = sx / n, my = sy / n;
+  let suu = 0, svv = 0, suv = 0, suuu = 0, svvv = 0, suvv = 0, svuu = 0;
+  for (let i = 0; i < q.length; i += 2) {
+    const u = q[i] - mx, v = q[i + 1] - my;
+    suu += u * u; svv += v * v; suv += u * v; suuu += u * u * u; svvv += v * v * v; suvv += u * v * v; svuu += v * u * u;
+  }
+  const det = suu * svv - suv * suv; if (Math.abs(det) < 1e-9) return null;
+  const r1 = (suuu + suvv) / 2, r2 = (svvv + svuu) / 2;
+  const uc = (r1 * svv - r2 * suv) / det, vc = (r2 * suu - r1 * suv) / det;
+  const R = Math.sqrt(uc * uc + vc * vc + (suu + svv) / n);
+  return { cx: uc + mx, cy: vc + my, r: R };
+}
+
+function recognizeShape(raw) {
+  if (raw.length < 16) return null;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let i = 0; i < raw.length; i += 2) { x0 = Math.min(x0, raw[i]); x1 = Math.max(x1, raw[i]); y0 = Math.min(y0, raw[i + 1]); y1 = Math.max(y1, raw[i + 1]); }
+  const diag = Math.hypot(x1 - x0, y1 - y0);
+  if (diag < 16) return null;                        // too small to be a deliberate shape
+  const L = pathLen(raw);
+  const q = resample(raw, Math.max(1, L / 160));      // ~160 even points, whatever the drawing speed
+  const n = q.length / 2, step = 2;
+  const sx = q[0], sy = q[1], ex = q[q.length - 2], ey = q[q.length - 1];
+  const gap = Math.hypot(ex - sx, ey - sy);
+  const closed = gap < Math.max(0.12 * L, 0.2 * diag) && L > 2.2 * diag * 0.9;
+
+  if (!closed) {
+    const chord = gap;
+    // straight line: nothing strays far from the chord
+    let dev = 0;
+    for (let i = 0; i < q.length; i += 2) dev = Math.max(dev, Math.sqrt(distSegSq(q[i], q[i + 1], sx, sy, ex, ey)));
+    if (chord > 0.85 * L || dev < 0.07 * chord) {
+      if (L > 1.25 * chord) { /* went back on itself: maybe an arrow, below */ }
+      else {
+        let a = Math.atan2(ey - sy, ex - sx); a = snapAngle(a, Math.PI / 4, 6 * Math.PI / 180);
+        const tx = sx + Math.cos(a) * chord, ty = sy + Math.sin(a) * chord;
+        return { kind: 'line', xy: polyPoints([[sx, sy], [tx, ty]], false, step), ax: sx, ay: sy };
+      }
+    }
+    // arrow: a straight shaft to the farthest point (the tip), then a short head that stays near the tip
+    let ti = 0, td = 0;
+    for (let i = 0; i < n; i++) { const d = Math.hypot(q[2 * i] - sx, q[2 * i + 1] - sy); if (d > td) { td = d; ti = i; } }
+    for (let i = 0; i < ti; i++) { if (Math.hypot(q[2 * i] - sx, q[2 * i + 1] - sy) >= 0.96 * td) { ti = i; td = Math.hypot(q[2 * i] - sx, q[2 * i + 1] - sy); break; } }   // first arrival at the tip (the head may pass it again)
+    if (ti > 4 && ti < n - 2) {
+      const tx = q[2 * ti], ty = q[2 * ti + 1];
+      let sdev = 0;
+      for (let i = 0; i <= ti; i++) sdev = Math.max(sdev, Math.sqrt(distSegSq(q[2 * i], q[2 * i + 1], sx, sy, tx, ty)));
+      let near = true, headLen = 0;
+      for (let i = ti; i < n; i++) { if (Math.hypot(q[2 * i] - tx, q[2 * i + 1] - ty) > 0.45 * td) near = false; }
+      for (let i = ti + 1; i < n; i++) headLen += Math.hypot(q[2 * i] - q[2 * i - 2], q[2 * i + 1] - q[2 * i - 1]);
+      if (sdev < 0.08 * td && near && headLen > 0.12 * td && headLen < 1.4 * td) {
+        let a = Math.atan2(ty - sy, tx - sx); a = snapAngle(a, Math.PI / 4, 6 * Math.PI / 180);
+        const X = sx + Math.cos(a) * td, Y = sy + Math.sin(a) * td, h = Math.min(60, Math.max(10, 0.2 * td)), w = 28 * Math.PI / 180;
+        const b1 = [X - h * Math.cos(a - w), Y - h * Math.sin(a - w)], b2 = [X - h * Math.cos(a + w), Y - h * Math.sin(a + w)];
+        const xy = polyPoints([[sx, sy], [X, Y], b1], false, step);
+        xy.push(...polyPoints([b1, [X, Y], b2], false, step).slice(2));
+        return { kind: 'arrow', xy, ax: sx, ay: sy };
+      }
+    }
+    // arc: points lie on a circle, and it doesn't go all the way round
+    const c = fitCircle(q);
+    if (c && c.r < 4 * diag) {
+      let err = 0;
+      for (let i = 0; i < q.length; i += 2) err += Math.abs(Math.hypot(q[i] - c.cx, q[i + 1] - c.cy) - c.r);
+      err /= n;
+      if (err < 0.035 * c.r + 0.6) {
+        const a0 = Math.atan2(sy - c.cy, sx - c.cx);
+        let sweep = 0, prev = a0;
+        for (let i = 1; i < n; i++) { const a = Math.atan2(q[2 * i + 1] - c.cy, q[2 * i] - c.cx); let d = a - prev; if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI; sweep += d; prev = a; }
+        if (Math.abs(sweep) > 0.35 && Math.abs(sweep) < 2 * Math.PI * 0.92) {
+          const k = Math.max(16, Math.ceil(Math.abs(sweep) * c.r / step)), xy = [];
+          for (let i = 0; i <= k; i++) { const a = a0 + sweep * i / k; xy.push(c.cx + c.r * Math.cos(a), c.cy + c.r * Math.sin(a)); }
+          return { kind: 'arc', xy, ax: sx, ay: sy };
+        }
+      }
+    }
+    return null;
+  }
+
+  // ----- closed: ellipse/circle or polygon, whichever fits better -----
+  let mx = 0, my = 0;
+  for (let i = 0; i < q.length; i += 2) { mx += q[i]; my += q[i + 1]; }
+  mx /= n; my /= n;
+  let cxx = 0, cyy = 0, cxy = 0;
+  for (let i = 0; i < q.length; i += 2) { const u = q[i] - mx, v = q[i + 1] - my; cxx += u * u; cyy += v * v; cxy += u * v; }
+  cxx /= n; cyy /= n; cxy /= n;
+  let th = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+  const ct = Math.cos(th), st = Math.sin(th);
+  let ua = 0, va = 0;   // extents along the principal axes
+  for (let i = 0; i < q.length; i += 2) { const u = q[i] - mx, v = q[i + 1] - my; ua = Math.max(ua, Math.abs(u * ct + v * st)); va = Math.max(va, Math.abs(-u * st + v * ct)); }
+  let ea = Math.sqrt(2 * (cxx * ct * ct + 2 * cxy * ct * st + cyy * st * st));
+  let eb = Math.sqrt(2 * (cxx * st * st - 2 * cxy * ct * st + cyy * ct * ct));
+  let eErr = 0;
+  for (let i = 0; i < q.length; i += 2) {
+    const u = q[i] - mx, v = q[i + 1] - my, pu = u * ct + v * st, pv = -u * st + v * ct;
+    const r = Math.hypot(pu / ea, pv / eb);
+    eErr += Math.abs(r - 1) * Math.hypot(pu, pv) / (r || 1);
+  }
+  eErr /= n;
+
+  // polygon corners: RDP from the start point and from the point farthest from it
+  let fi = 0, fd = 0;
+  for (let i = 0; i < n; i++) { const d = Math.hypot(q[2 * i] - sx, q[2 * i + 1] - sy); if (d > fd) { fd = d; fi = i; } }
+  const eps = 0.07 * diag, keep = [0];
+  rdp(q, 0, fi, eps, keep); keep.push(fi); rdp(q, fi, n - 1, eps, keep);
+  let v = keep.map(i => [q[2 * i], q[2 * i + 1]]);
+  // merge corners that are close together, then drop corners that are nearly straight
+  for (let changed = true; changed && v.length > 2;) {
+    changed = false;
+    for (let i = 0; i < v.length && v.length > 2; i++) {
+      const a = v[(i - 1 + v.length) % v.length], b = v[i], c = v[(i + 1) % v.length];
+      if (Math.hypot(b[0] - c[0], b[1] - c[1]) < 0.12 * diag) { v[i] = [(b[0] + c[0]) / 2, (b[1] + c[1]) / 2]; v.splice((i + 1) % v.length, 1); changed = true; break; }
+      if (angleAt(a[0], a[1], b[0], b[1], c[0], c[1]) > 155) { v.splice(i, 1); changed = true; break; }
+    }
+  }
+  // how sharp the corners are: share of the stroke's total turning that happens right at the corners.
+  // A real polygon turns almost only at its corners; a wobbly circle turns everywhere.
+  let conc = 0;
+  if (v.length >= 3) {
+    const k = 3, head = i => { const a = Math.max(0, Math.min(n - 1 - k, i)); return Math.atan2(q[2 * (a + k) + 1] - q[2 * a + 1], q[2 * (a + k)] - q[2 * a]); };
+    const w = Math.max(3, Math.round(n / 30));
+    for (const p of v) {
+      let bi = 0, bd = Infinity;
+      for (let i = 0; i < n; i++) { const d = Math.hypot(q[2 * i] - p[0], q[2 * i + 1] - p[1]); if (d < bd) { bd = d; bi = i; } }
+      // heading just before the corner vs just after it (a corner at the very start/end compares end with start)
+      const before = bi - w - k < 0 ? head(n - 1 - k - (w - bi)) : head(bi - w - k), after = bi + w > n - 1 - k ? head(bi + w - (n - 1 - k)) : head(bi + w);
+      let d = after - before; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI;
+      conc += Math.abs(d);
+    }
+    conc /= 2 * Math.PI;
+  }
+  let pErr = Infinity;
+  if (v.length >= 3 && v.length <= 8) {
+    pErr = 0;
+    for (let i = 0; i < q.length; i += 2) {
+      let d = Infinity;
+      for (let j = 0; j < v.length; j++) { const A = v[j], B = v[(j + 1) % v.length]; d = Math.min(d, distSegSq(q[i], q[i + 1], A[0], A[1], B[0], B[1])); }
+      pErr += Math.sqrt(d);
+    }
+    pErr /= n;
+  }
+  const lim = 0.045 * diag;
+  if (Math.min(eErr, pErr) > lim) return null;
+  if (eErr > lim && !(pErr <= lim)) return null;
+
+  // polygon only when it has real corners and fits better than an ellipse; a polygon has more freedom, so it must fit better
+  const polygonish = pErr < eErr && (v.length <= 4 ? conc > 0.6 : conc > 0.85 && pErr < 0.8 * eErr);
+  if (!polygonish) {
+    if (ea / eb < 1.18) { const r = (ea + eb) / 2; return { kind: 'circle', xy: ellipsePoints(mx, my, r, r, 0, step), ax: mx, ay: my }; }
+    th = snapAngle(th, Math.PI / 2, 8 * Math.PI / 180);
+    return { kind: 'ellipse', xy: ellipsePoints(mx, my, ea, eb, th, step), ax: mx, ay: my };
+  }
+
+  let cx = 0, cy = 0; for (const p of v) { cx += p[0]; cy += p[1]; } cx /= v.length; cy /= v.length;
+  if (v.length === 4) {
+    const angs = v.map((b, i) => { const a = v[(i + 3) % 4], c = v[(i + 1) % 4]; return angleAt(a[0], a[1], b[0], b[1], c[0], c[1]); });
+    if (angs.every(a => Math.abs(a - 90) < 20)) {
+      // rectangle: average edge direction (mod 90°), extents of the corners along it
+      let sc = 0, ss = 0;
+      for (let i = 0; i < 4; i++) { const a = v[i], b = v[(i + 1) % 4], d = Math.atan2(b[1] - a[1], b[0] - a[0]) * 4; const l = Math.hypot(b[0] - a[0], b[1] - a[1]); sc += Math.cos(d) * l; ss += Math.sin(d) * l; }
+      let o = Math.atan2(ss, sc) / 4; o = snapAngle(o, Math.PI / 2, 8 * Math.PI / 180);
+      const co = Math.cos(o), so = Math.sin(o);
+      let u0 = Infinity, u1 = -Infinity, w0 = Infinity, w1 = -Infinity;
+      for (const p of v) { const u = (p[0] - cx) * co + (p[1] - cy) * so, w = -(p[0] - cx) * so + (p[1] - cy) * co; u0 = Math.min(u0, u); u1 = Math.max(u1, u); w0 = Math.min(w0, w); w1 = Math.max(w1, w); }
+      let hu = (u1 - u0) / 2, hw = (w1 - w0) / 2, ou = (u0 + u1) / 2, ow = (w0 + w1) / 2;
+      let kind = 'rectangle';
+      if (Math.max(hu, hw) / Math.min(hu, hw) < 1.12) { hu = hw = (hu + hw) / 2; kind = 'square'; }
+      const ccx = cx + ou * co - ow * so, ccy = cy + ou * so + ow * co;
+      const corner = (a, b) => [ccx + a * co - b * so, ccy + a * so + b * co];
+      const rv = [corner(-hu, -hw), corner(hu, -hw), corner(hu, hw), corner(-hu, hw)];
+      return { kind, xy: polyPoints(rv, true, step), ax: ccx, ay: ccy };
+    }
+  }
+  if (v.length === 3) {
+    // right angle: if one corner is close to 90°, move it onto the circle over the opposite side
+    for (let i = 0; i < 3; i++) {
+      const a = v[(i + 2) % 3], b = v[i], c = v[(i + 1) % 3];
+      if (Math.abs(angleAt(a[0], a[1], b[0], b[1], c[0], c[1]) - 90) < 10) {
+        const mx2 = (a[0] + c[0]) / 2, my2 = (a[1] + c[1]) / 2, R = Math.hypot(a[0] - c[0], a[1] - c[1]) / 2;
+        const d = Math.hypot(b[0] - mx2, b[1] - my2) || 1;
+        v[i] = [mx2 + (b[0] - mx2) / d * R, my2 + (b[1] - my2) / d * R];
+        break;
+      }
+    }
+    return { kind: 'triangle', xy: polyPoints(v, true, step), ax: cx, ay: cy };
+  }
+  if (v.length >= 5) {
+    // nearly regular (even sides): make it exactly regular
+    const lens = v.map((p, i) => Math.hypot(v[(i + 1) % v.length][0] - p[0], v[(i + 1) % v.length][1] - p[1]));
+    const avg = lens.reduce((s, x) => s + x, 0) / lens.length;
+    if (lens.every(l => Math.abs(l - avg) < 0.3 * avg)) {
+      const R = v.reduce((s, p) => s + Math.hypot(p[0] - cx, p[1] - cy), 0) / v.length;
+      const a0 = Math.atan2(v[0][1] - cy, v[0][0] - cx), dir = ((v[1][0] - v[0][0]) * (cy - v[0][1]) - (v[1][1] - v[0][1]) * (cx - v[0][0])) > 0 ? -1 : 1;
+      const rv = v.map((_, i) => { const a = a0 + dir * 2 * Math.PI * i / v.length; return [cx + R * Math.cos(a), cy + R * Math.sin(a)]; });
+      return { kind: 'polygon', xy: polyPoints(rv, true, step), ax: cx, ay: cy };
+    }
+  }
+  return { kind: v.length === 4 ? 'quadrilateral' : 'polygon', xy: polyPoints(v, true, step), ax: cx, ay: cy };
 }
 
 /* ---------- toolbar: docked on a full page; one floating copy shared by every section in notes ---------- */
@@ -716,6 +978,57 @@ class Surface {
     const pr = this.pressure(e);
     a.p.push(x, y, pr);
     inkBegin(ctx, a.st, x, y, pr);
+    if (type === 'pen' && this.plugin.settings.shapes) { a.hold = true; this.holdFrom(a, x, y); }
+  }
+  /* ----- shapes: hold the pen still at the end of a stroke and it snaps to a clean shape ----- */
+  holdFrom(a, x, y) {   // the pen moved: restart the stillness clock from here
+    a.hx = x; a.hy = y;
+    clearTimeout(a.holdT);
+    a.holdT = setTimeout(() => this.snapShape(a), this.plugin.settings.shapeHold);
+  }
+  snapShape(a) {
+    if (this.active !== a || a.shape) return;
+    const p = a.p, xy = [];
+    for (let i = 0; i < p.length; i += 3) xy.push(p[i], p[i + 1]);
+    let r = null;
+    try { r = recognizeShape(xy); } catch (err) { console.error('Scribble: shape recognition failed', err); }
+    if (!r) return;   // not a shape: the stroke stays as drawn
+    a.shape = { kind: r.kind, base: r.xy, xy: r.xy, ax: r.ax, ay: r.ay, rx: a.hx - r.ax, ry: a.hy - r.ay };
+    this.drawLiveShape(a);
+  }
+  adjustShape(a, x, y) {   // still holding after the snap: scale and turn the shape around its anchor to follow the pen
+    const S = a.shape, r0 = Math.hypot(S.rx, S.ry);
+    if (r0 < 3) return;
+    const vx = x - S.ax, vy = y - S.ay;
+    let k = Math.hypot(vx, vy) / r0, rot = Math.atan2(vy, vx) - Math.atan2(S.ry, S.rx);
+    if (k < 0.05) k = 0.05;
+    if (S.kind === 'line' || S.kind === 'arrow') {   // keep lines on 0/45/90 degrees when close
+      const b = S.base, n = b.length;
+      const end = S.kind === 'line' ? [b[n - 2], b[n - 1]] : [S.ax + S.rx, S.ay + S.ry];
+      const a0 = Math.atan2(end[1] - S.ay, end[0] - S.ax);
+      rot = snapAngle(a0 + rot, Math.PI / 4, 5 * Math.PI / 180) - a0;
+    }
+    const c = Math.cos(rot) * k, s = Math.sin(rot) * k, b = S.base, out = new Array(b.length);
+    for (let i = 0; i < b.length; i += 2) {
+      const u = b[i] - S.ax, v = b[i + 1] - S.ay;
+      out[i] = S.ax + u * c - v * s; out[i + 1] = S.ay + u * s + v * c;
+    }
+    S.xy = out;
+    if (S.queued) return;
+    S.queued = true;
+    this.win.requestAnimationFrame(() => { S.queued = false; if (this.active === a && a.shape === S) this.drawLiveShape(a); });
+  }
+  shapePoints(xy) {   // flat [x, y] -> stored [x, y, pressure]: even width
+    const p = [];
+    for (let i = 0; i < xy.length; i += 2) p.push(Math.round(xy[i] * 10) / 10, Math.round(xy[i + 1] * 10) / 10, 0.5);
+    return p;
+  }
+  drawLiveShape(a) {
+    this.octx.setTransform(1, 0, 0, 1, 0, 0);
+    this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
+    const ctx = this.aimOverlay();
+    ctx.strokeStyle = ctx.fillStyle = this.resolveColor(a.c);
+    drawStroke(ctx, { t: a.t, s: a.s, p: this.shapePoints(a.shape.xy) });
   }
   pressure(e) {
     if (e.pointerType !== 'pen') return 0.5;
@@ -733,6 +1046,8 @@ class Surface {
       const ev = evs.length ? evs[i] : e;
       const [x, y] = this.point(a, ev);
       if (a.erasing) { this.eraseAt(a, x, y); a.ex = x; a.ey = y; continue; }
+      if (a.shape) { if (i === n - 1) this.adjustShape(a, x, y); continue; }
+      if (a.hold) { const tol = SHAPE_STILL_PX / this.scale, hx = x - a.hx, hy = y - a.hy; if (hx * hx + hy * hy > tol * tol) this.holdFrom(a, x, y); }
       const dx = x - a.st.px, dy = y - a.st.py;
       if (dx * dx + dy * dy < 0.36) continue;
       const pr = this.pressure(ev);
@@ -752,6 +1067,7 @@ class Surface {
   endStroke(discard) {
     const a = this.active; if (!a) return;
     this.active = null;
+    clearTimeout(a.holdT);
     this.root.removeClass('is-inking');
     if (a.select) { this.selEnd(a, discard); return; }
     if (a.erasing) {
@@ -766,6 +1082,18 @@ class Surface {
     }
     const s = { t: a.t, c: a.c, s: a.s, p };
     computeBB(s);
+    if (a.shape) {
+      // Like Apple: one undo turns the shape back into what was drawn, a second removes it.
+      const shape = { t: a.t, c: a.c, s: a.s, p: this.shapePoints(a.shape.xy) };
+      computeBB(shape);
+      const before = this.strokes.slice(); before.push(s);
+      this.addStrokes([shape], true);
+      this.clearOverlay();
+      this.pushUndo({ t: 'add', strokes: [s] });
+      this.pushUndo({ t: 'swap', before, after: this.strokes.slice() });
+      this.changed(); this.refreshBar();
+      return;
+    }
     this.addStrokes([s], true);   // bake into the tiles ...
     this.clearOverlay();          // ... and drop the live copy in the same frame
     this.pushUndo({ t: 'add', strokes: [s] });
@@ -1112,6 +1440,16 @@ class ScribbleSettings extends PluginSettingTab {
       .setDesc('Size of the eraser circle. It is shown under the pen while erasing.')
       .addSlider(sl => sl.setLimits(4, 60, 1).setValue(plugin.settings.eraserSize).setDynamicTooltip()
         .onChange(v => { plugin.settings.eraserSize = v; plugin.saveData(plugin.settings); }));
+    new Setting(el).setName('Shapes').setHeading();
+    new Setting(el)
+      .setName('Recognise shapes')
+      .setDesc('Draw a line, circle, rectangle, triangle, arrow or arc with the pen and hold it still for a moment: it snaps to a clean shape. Keep holding and move to resize or turn it. Undo brings back what you drew.')
+      .addToggle(t => t.setValue(plugin.settings.shapes).onChange(v => { plugin.settings.shapes = v; plugin.saveData(plugin.settings); }));
+    new Setting(el)
+      .setName('Hold time')
+      .setDesc('How long to hold the pen still before the shape snaps, in milliseconds.')
+      .addSlider(sl => sl.setLimits(200, 1500, 50).setValue(plugin.settings.shapeHold).setDynamicTooltip()
+        .onChange(v => { plugin.settings.shapeHold = v; plugin.saveData(plugin.settings); }));
     new Setting(el).setName('Pens').setHeading()
       .setDesc('How each pen looks. Changes apply to everything already written with that pen, on every device.');
     for (const kind in LOOK_DEFAULTS) this.penSection(el, kind);
@@ -1191,6 +1529,8 @@ module.exports = class ScribblePlugin extends Plugin {
     if (!this.settings.looks || typeof this.settings.looks !== 'object') this.settings.looks = {};
     if (!ERASERS[this.settings.eraser]) this.settings.eraser = DEFAULT_SETTINGS.eraser;
     if (!(this.settings.eraserSize >= 4 && this.settings.eraserSize <= 60)) this.settings.eraserSize = DEFAULT_SETTINGS.eraserSize;
+    if (typeof this.settings.shapes !== 'boolean') this.settings.shapes = DEFAULT_SETTINGS.shapes;
+    if (!(this.settings.shapeHold >= 200 && this.settings.shapeHold <= 1500)) this.settings.shapeHold = DEFAULT_SETTINGS.shapeHold;
     LOOKS = makeLooks(this.settings.looks);
     this.addSettingTab(new ScribbleSettings(this.app, this));
     this.surfaces = new Set(); this.bars = new Set();
