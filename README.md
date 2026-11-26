@@ -22,6 +22,6 @@ Handwriting is saved as `.scribble` files (JSON) in the `Scribble` folder.
 2. Run **BRAT: Add a beta plugin for testing** and enter `rabby0101/obsidian-scribble`.
 3. Enable **Scribble (Rabby)** under Community plugins.
 
-## Licence
+## License
 
-MIT
+Copyright © 2026 Sk Fazla Rabby. All rights reserved. Free to install and use; copying, modifying and redistributing are not allowed. See [LICENSE](LICENSE).
